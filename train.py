@@ -96,9 +96,9 @@ def capture_rng():
 def restore_rng(s):
     random.setstate(s["python"])
     np.random.set_state(s["numpy"])
-    torch.set_rng_state(s["torch"])
-    if torch.cuda.is_available() and "cuda" in s:
-        torch.cuda.set_rng_state_all(s["cuda"])
+    torch.set_rng_state(s["torch"].cpu().to(torch.uint8))
+    if torch.cuda.is_available() and s.get("cuda") is not None:
+        torch.cuda.set_rng_state_all([t.cpu().to(torch.uint8) for t in s["cuda"]])
 
 
 def atomic_save(obj, path):
