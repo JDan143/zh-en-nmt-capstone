@@ -183,11 +183,22 @@ def clean(pairs: Iterable[tuple[str, str]], do_langid: bool) -> list[tuple[str, 
         DetectorFactory.seed = C.SEED
         detector = detect
 
+    pairs = list(pairs)
+    total = len(pairs)
+    # langid runs detect() twice per pair and is the slow step (minutes-to-hours on the full corpus), so emit a heartbeat instead of going silent.
+    print(f"[clean] starting on {total:,} pairs "
+          f"(langid={'ON — this is the slow part' if do_langid else 'off'})...",
+          flush=True)
+
     seen_src: set[str] = set()
     out: list[tuple[str, str]] = []
     n0 = 0
     for zh, en in pairs:
         n0 += 1
+        if n0 % 20000 == 0:
+            pct = 100.0 * n0 / total
+            print(f"[clean] {n0:,}/{total:,} ({pct:4.1f}%) processed, "
+                  f"{len(out):,} kept", flush=True)
         zh, en = zh.strip(), en.strip()
         if not zh or not en:
             continue
