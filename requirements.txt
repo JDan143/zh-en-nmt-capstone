@@ -1,0 +1,23 @@
+# SpeechBridge / zh-en-nmt-capstone — dependencies
+#
+# torch is intentionally left unpinned: Colab and Kaggle ship a torch build tied
+# to their CUDA driver, and force-installing a different wheel usually breaks GPU
+# support. Use whatever torch the platform provides. If you do install it yourself,
+# grab the official CUDA wheel from https://pytorch.org/get-started/locally/.
+
+torch>=2.3            # use the platform CUDA build on Colab/Kaggle
+sentencepiece==0.2.1
+sacrebleu==2.6.0      # flores200/spBLEU tokenizer needs >=2.3.0
+datasets>=2.18        # FLORES+ only; floor not a hard pin (exact pins clash with the
+                      # datasets/huggingface_hub already on Colab/Kaggle)
+langdetect==1.0.9     # language-ID filter in preprocessing
+numpy>=1.26           # floor only; Colab/Kaggle pin their own
+tqdm==4.68.3
+pyyaml==6.0.3
+requests==2.34.2      # direct OPUS / statmt downloads
+
+# Notes:
+#  - sacremoses isn't needed (sacrebleu tokenizes internally).
+#  - We skip the script-based HF loaders Helsinki-NLP/open_subtitles and
+#    Helsinki-NLP/news_commentary because modern datasets refuses remote code;
+#    preprocess.py downloads those corpora directly.
