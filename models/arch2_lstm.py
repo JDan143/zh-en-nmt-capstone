@@ -86,6 +86,24 @@ class Arch2LSTM(Seq2SeqBase):
         self.W_c = nn.Linear(2 * self.H, self.H)         # attentional vector
         self.out = nn.Linear(self.H, vocab_size)
 
+        # Forget-gate bias = 1.0 (Jozefowicz et al., 2015; Gers et al., 2000). With
+        # input-feeding over long sequences the decoder is a very deep recurrence,
+        # the default ~0 forget bias lets the cell state decay, gradients vanish, and
+        # the model collapses to the unigram distribution. Biasing the forget gate
+        # toward "remember" keeps the state (and gradients) alive. PyTorch LSTM bias
+        # layout per gate is [input, forget, cell, output], total bias = ih + hh, so
+        # we set ih's forget slice to 1 and zero hh's forget slice for a net bias 1.
+        for lstm in (self.encoder, self.decoder):
+            for name, param in lstm.named_parameters():
+                if "bias_ih" in name:
+                    n = param.size(0) // 4
+                    with torch.no_grad():
+                        param[n:2 * n].fill_(1.0)
+                elif "bias_hh" in name:
+                    n = param.size(0) // 4
+                    with torch.no_grad():
+                        param[n:2 * n].zero_()
+
     def encode(self, src, src_len):
         emb = self.dropout(self.src_emb(src))
         packed = nn.utils.rnn.pack_padded_sequence(
