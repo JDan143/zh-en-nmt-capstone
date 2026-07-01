@@ -1,17 +1,22 @@
 """
 models/arch3_convs2s.py — Architecture 3: Convolutional Seq2Seq (Gehring 2017).
 
-Config: emb 256 + learned absolute position emb (max_len 1024); conv channels 256;
+Spec: emb 256 + learned absolute position emb (max_len 1024); conv channels 256;
 kernel 3; 6 encoder blocks; 6 decoder blocks; block = Conv1d(2C) -> GLU -> residual;
 decoder convs causally masked via F.pad(x,(k-1,0)); multi-step attention between
 each decoder block and encoder outputs; dropout 0.1 (inputs)/0.2 (attention);
-NAG / SGD+Nesterov (lr 0.25, momentum 0.99); batch 64; clip 0.1.
+NAG (lr 0.25, momentum 0.99); batch 64; clip 0.1.
 
 Compact reimplementation: residual connections are scaled
 by sqrt(0.5) (the ConvS2S stabiliser), attention values are (encoder output +
 source embedding), and each decoder block has its own attention ("multi-step").
 The decoder runs in parallel under teacher forcing (causal left-padding), so
 _decode_full returns [B, L, V] in a single pass.
+
+Weight normalization (Salimans & Kingma, 2016) is applied to ALL layers except the
+embedding lookup tables, exactly as Gehring et al. (2017) specify. This is what
+makes NAG at lr 0.25 stable: without it the raw conv weights grow unboundedly and
+training diverges.
 """
 from __future__ import annotations
 import math
@@ -21,6 +26,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.parametrizations import weight_norm as _weight_norm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config as C  # noqa: E402
@@ -29,13 +35,18 @@ from models.common import Seq2SeqBase, pad_mask  # noqa: E402
 SCALE = math.sqrt(0.5)
 
 
+def _wn(module):
+    """Weight-normalize a conv/linear layer (Gehring uses it on all non-lookup layers)."""
+    return _weight_norm(module)
+
+
 class ConvBlock(nn.Module):
     def __init__(self, channels, kernel, dropout, causal):
         super().__init__()
         self.kernel = kernel
         self.causal = causal
-        self.conv = nn.Conv1d(channels, 2 * channels, kernel,
-                              padding=0 if causal else kernel // 2)
+        self.conv = _wn(nn.Conv1d(channels, 2 * channels, kernel,
+                                  padding=0 if causal else kernel // 2))
         self.drop = nn.Dropout(dropout)
 
     def forward(self, x):  # x: [B, C, L]
@@ -60,8 +71,8 @@ class Arch3ConvS2S(Seq2SeqBase):
         self.tok_emb = nn.Embedding(vocab_size, E, padding_idx=C.PAD_ID)
         self.pos_emb = nn.Embedding(cfg.conv_max_pos, E)
         self.in_drop = nn.Dropout(cfg.dropout)  # 0.1
-        self.emb2c = nn.Linear(E, Cc)
-        self.c2emb = nn.Linear(Cc, E)
+        self.emb2c = _wn(nn.Linear(E, Cc))
+        self.c2emb = _wn(nn.Linear(Cc, E))
 
         self.enc_blocks = nn.ModuleList(
             [ConvBlock(Cc, cfg.kernel_size, cfg.dropout, causal=False)
@@ -70,10 +81,16 @@ class Arch3ConvS2S(Seq2SeqBase):
             [ConvBlock(Cc, cfg.kernel_size, cfg.dropout, causal=True)
              for _ in range(cfg.conv_blocks)])
         # per-decoder-block attention projections (multi-step attention)
-        self.attn_q = nn.ModuleList([nn.Linear(Cc, E) for _ in range(cfg.conv_blocks)])
-        self.attn_o = nn.ModuleList([nn.Linear(E, Cc) for _ in range(cfg.conv_blocks)])
-        self.enc_out2emb = nn.Linear(Cc, E)
-        self.out = nn.Linear(Cc, vocab_size)
+        self.attn_q = nn.ModuleList([_wn(nn.Linear(Cc, E)) for _ in range(cfg.conv_blocks)])
+        self.attn_o = nn.ModuleList([_wn(nn.Linear(E, Cc)) for _ in range(cfg.conv_blocks)])
+        self.enc_out2emb = _wn(nn.Linear(Cc, E))
+        self.out = _wn(nn.Linear(Cc, vocab_size))
+
+        # Gehring et al. init: lookup tables ~ N(0, 0.1); pad row zeroed.
+        nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.1)
+        nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.1)
+        with torch.no_grad():
+            self.tok_emb.weight[C.PAD_ID].zero_()
 
     def _positions(self, x):
         L = x.size(1)
