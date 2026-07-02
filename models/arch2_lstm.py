@@ -1,8 +1,8 @@
 """
 models/arch2_lstm.py — Architecture 2: LSTM Seq2Seq + Luong attention.
 
-Config: emb 256; 2-layer BiLSTM encoder (hidden 512/dir); 2-layer LSTM decoder
-(hidden 512); dropout 0.3; Adam lr 1e-3; batch 128; clip 1.0.
+Config: emb 256; 2-layer BiLSTM encoder (hidden 512/dir), 2-layer LSTM decoder
+(hidden 512), dropout 0.3, Adam lr 1e-3, batch 128, clip 1.0.
 
 Luong (2015) global attention with all three score functions:
     dot     : score(h_t, h_s) = h_tᵀ h_s
@@ -84,6 +84,7 @@ class Arch2LSTM(Seq2SeqBase):
                                batch_first=True)
         self.attn = LuongAttention(self.H, self.variant, cfg.attn_dim)
         self.W_c = nn.Linear(2 * self.H, self.H)         # attentional vector
+        self.attn_ln = nn.LayerNorm(self.H)
         self.out = nn.Linear(self.H, vocab_size)
 
         # Forget-gate bias = 1.0 (Jozefowicz et al., 2015; Gers et al., 2000). With
@@ -142,7 +143,7 @@ class Arch2LSTM(Seq2SeqBase):
             out, (h, c) = self.decoder(dec_in, (h, c))
             h_t = out.squeeze(1)
             ctx, _ = self.attn(h_t, enc, mask)
-            attn_vec = torch.tanh(self.W_c(torch.cat([ctx, h_t], dim=-1)))
+            attn_vec = torch.tanh(self.attn_ln(self.W_c(torch.cat([ctx, h_t], dim=-1))))
             logit = self.out(attn_vec)
             outs.append(logit)
             if gold is not None:
@@ -176,7 +177,7 @@ class Arch2LSTM(Seq2SeqBase):
         out, (h, c) = self.decoder(dec_in, (state["h"], state["c"]))
         h_t = out.squeeze(1)
         ctx, _ = self.attn(h_t, enc, mask)
-        attn_vec = torch.tanh(self.W_c(torch.cat([ctx, h_t], dim=-1)))
+        attn_vec = torch.tanh(self.attn_ln(self.W_c(torch.cat([ctx, h_t], dim=-1))))
         state["h"], state["c"], state["attn_vec"] = h, c, attn_vec
         return self.out(attn_vec)
 
