@@ -166,12 +166,21 @@ def translate_corpus(model, cfg, sp, src_texts, target_lang, device,
 # ─────────────────────────────────────────────────────────────────────────────
 def score(hyps, refs, output_lang, with_spbleu=False):
     from sacrebleu.metrics import BLEU, CHRF, TER
-    bleu_tok = "zh" if output_lang == "zh" else "13a"
-    res = {
-        "BLEU": BLEU(tokenize=bleu_tok).corpus_score(hyps, [refs]).score,
-        "chrF++": CHRF(word_order=2).corpus_score(hyps, [refs]).score,
-        "TER": TER().corpus_score(hyps, [refs]).score,
-    }
+    if output_lang == "zh":
+        cseg = lambda s: " ".join(s.replace(" ", ""))
+        h_c = [cseg(x) for x in hyps]
+        r_c = [cseg(x) for x in refs]
+        res = {
+            "BLEU": BLEU(tokenize="zh").corpus_score(hyps, [refs]).score,
+            "chrF++": CHRF(word_order=2).corpus_score(h_c, [r_c]).score,
+            "TER": TER().corpus_score(h_c, [r_c]).score,
+        }
+    else:
+        res = {
+            "BLEU": BLEU(tokenize="13a").corpus_score(hyps, [refs]).score,
+            "chrF++": CHRF(word_order=2).corpus_score(hyps, [refs]).score,
+            "TER": TER().corpus_score(hyps, [refs]).score,
+        }
     if with_spbleu:
         res["spBLEU"] = BLEU(tokenize="flores200").corpus_score(hyps, [refs]).score
     return res
