@@ -199,7 +199,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     print(f"[train] AMP {'ON' if use_amp else ('off (cpu)' if device.type != 'cuda' else 'off (fp32 for this arch)')}")
 
-    logger = MetricsLogger(os.path.join(C.RESULTS_DIR, "metrics_log.csv"))
+    logger = MetricsLogger(os.path.join(C.RESULTS_DIR, f"metrics_log_seed{args.seed}.csv"))
     best_path = os.path.join(C.CKPT_DIR, f"{args.arch}_seed{args.seed}_best.pt")
     last_path = os.path.join(C.CKPT_DIR, f"{args.arch}_seed{args.seed}_last.pt")
     max_batches = 30 if C.SMOKE else None
