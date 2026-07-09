@@ -223,7 +223,7 @@ def corpus_perplexity(model, cfg, sp, src_texts, ref_texts, target_lang, device,
 # efficiency from metrics_log.csv
 # ─────────────────────────────────────────────────────────────────────────────
 def efficiency_from_log(arch, seed):
-    path = os.path.join(C.RESULTS_DIR, "metrics_log.csv")
+    path = os.path.join(C.RESULTS_DIR, f"metrics_log_seed{seed}.csv")
     times, vram = [], []
     if os.path.exists(path):
         with open(path) as f:
