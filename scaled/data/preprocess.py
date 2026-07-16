@@ -39,7 +39,9 @@ import gzip
 import io
 import os
 import random
+import re
 import sys
+import time
 import unicodedata
 import zipfile
 from typing import Iterable
@@ -60,21 +62,37 @@ def _download(url: str, dest: str, timeout: int = 60) -> str:
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         print(f"[cache] {dest}")
         return dest
-    print(f"[download] {url}")
+    print(f"[download] {url}", flush=True)
     os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
     with requests.get(url, stream=True, timeout=timeout) as r:
         r.raise_for_status()
+        total = int(r.headers.get("Content-Length") or 0)
+        got = 0
+        next_mark = 0
+        t0 = time.time()
         tmp = dest + ".part"
         with open(tmp, "wb") as f:
             for chunk in r.iter_content(chunk_size=1 << 20):
-                if chunk:
-                    f.write(chunk)
+                if not chunk:
+                    continue
+                f.write(chunk)
+                got += len(chunk)
+                if got >= next_mark:
+                    mb = got / 1e6
+                    rate = mb / max(time.time() - t0, 0.1)
+                    if total:
+                        pct = 100.0 * got / total
+                        print(f"[download]   {mb:,.0f} / {total/1e6:,.0f} MB "
+                              f"({pct:4.1f}%)  {rate:.1f} MB/s", flush=True)
+                    else:
+                        print(f"[download]   {mb:,.0f} MB  {rate:.1f} MB/s", flush=True)
+                    next_mark = got + (50 << 20)   # every ~50 MB
         os.replace(tmp, dest)
+    print(f"[download] done -> {dest} ({os.path.getsize(dest)/1e6:,.0f} MB)", flush=True)
     return dest
 
 
 def opus_moses_url(corpus: str, version: str, l1: str, l2: str) -> str:
-    # OPUS expects the pair in alphabetical order: en before zh_cn.
     a, b = sorted([l1, l2])
     return f"https://object.pouta.csc.fi/OPUS-{corpus}/{version}/moses/{a}-{b}.txt.zip"
 
@@ -90,11 +108,18 @@ def _read_opus_moses_zip(zpath: str, corpus: str, l1: str, l2: str) -> list[tupl
         with z.open(en_member) as fe, z.open(zh_member) as fz:
             en_lines = io.TextIOWrapper(fe, encoding="utf-8")
             zh_lines = io.TextIOWrapper(fz, encoding="utf-8")
-            return [(zh.rstrip("\n"), en.rstrip("\n")) for zh, en in zip(zh_lines, en_lines)]
+            print(f"[{corpus}] reading aligned lines from the zip...", flush=True)
+            pairs = []
+            for i, (zh, en) in enumerate(zip(zh_lines, en_lines), 1):
+                pairs.append((zh.rstrip("\n"), en.rstrip("\n")))
+                if i % 1000000 == 0:
+                    print(f"[{corpus}]   {i:,} lines read", flush=True)
+            return pairs
 
 
 def load_opus_corpus(key: str, sample: int | None, seed: int,
                      l2_candidates: list[str] | None = None) -> list[tuple[str, str]]:
+                      
     d = C.DATA[key]
     corpus, version, l1 = d["corpus"], d["version"], d["l1"]
     candidates = l2_candidates or [d["l2"]]
@@ -114,6 +139,8 @@ def load_opus_corpus(key: str, sample: int | None, seed: int,
         raise RuntimeError(f"[{key}] could not download {corpus} {version} for any of "
                            f"{candidates}. Last error: {last_err}")
     if sample and len(pairs) > sample:
+        print(f"[{key}] sampling {sample:,} of {len(pairs):,} (seeded, reproducible)...",
+              flush=True)
         pairs = random.Random(seed).sample(pairs, sample)
         print(f"[{key}] capped to {len(pairs):,}")
     return pairs
@@ -130,7 +157,6 @@ def load_ted2020(seed: int) -> list[tuple[str, str]]:
 
 
 def _cjk_count(s: str) -> int:
-    """Number of CJK Unified Ideographs (a reliable zh-vs-en signal)."""
     return sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
 
 
@@ -202,42 +228,80 @@ def passes_ratio(zh: str, en: str, ratio_max: float) -> bool:
     return max(lz, le) / min(lz, le) <= ratio_max
 
 
-def langid_ok(zh: str, en: str, detector) -> bool:
-    try:
-        return detector(zh).startswith("zh") and detector(en) == "en"
-    except Exception:
+_RE_HAN = re.compile(r"[\u4e00-\u9fff]")                       # CJK Unified Ideographs
+_RE_LATIN = re.compile(r"[A-Za-z]")
+_RE_KANA = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")         # hiragana/katakana -> ja
+_RE_HANGUL = re.compile(r"[\uac00-\ud7af\u1100-\u11ff]")       # -> ko
+_RE_CYRILLIC = re.compile(r"[\u0400-\u04ff]")                  # -> ru/uk/...
+
+
+def script_ok(zh: str, en: str) -> bool:
+    # zh side
+    if _RE_KANA.search(zh) or _RE_HANGUL.search(zh):
         return False
+    n_han = len(_RE_HAN.findall(zh))
+    if n_han == 0:
+        return False
+    if len(_RE_LATIN.findall(zh)) > n_han:      # mostly Latin -> not really Chinese
+        return False
+    # en side
+    if (_RE_HAN.search(en) or _RE_KANA.search(en)
+            or _RE_HANGUL.search(en) or _RE_CYRILLIC.search(en)):
+        return False
+    if not _RE_LATIN.search(en):
+        return False
+    return True
+
+
+def langid_ok(zh: str, en: str, detector) -> bool:
+    if not script_ok(zh, en):
+        return False
+    if detector is not None and len(en) >= C.LANGID_MIN_EN_CHARS:
+        try:
+            return detector(en) == "en"
+        except Exception:  # noqa: BLE001
+            return True   # detector failure is not evidence of a bad pair
+    return True
 
 
 def clean(pairs: Iterable[tuple[str, str]], do_langid: bool,
           seen_src: set[str] | None = None,
           exclude_src: set[str] | None = None,
           tag: str = "clean") -> list[tuple[str, str]]:
+
     max_len = C.DATA["max_len_filter"]
     ratio_max = C.DATA["length_ratio_max"]
 
     detector = None
     if do_langid:
-        from langdetect import detect, DetectorFactory
-        DetectorFactory.seed = C.SEED
-        detector = detect
+        if C.LANGID_VERIFY_LONG_EN:
+            from langdetect import detect, DetectorFactory
+            DetectorFactory.seed = C.SEED
+            detector = detect
+            print(f"[{tag}] language filter: script check + langdetect on EN "
+                  f">= {C.LANGID_MIN_EN_CHARS} chars", flush=True)
+        else:
+            print(f"[{tag}] language filter: script check only (pure, no langdetect)",
+                  flush=True)
 
     pairs = list(pairs)
     total = len(pairs)
-    # langid runs detect() twice per pair and is the slow step (hours at this scale),
-    # so emit a heartbeat instead of going silent.
     print(f"[{tag}] starting on {total:,} pairs "
-          f"(langid={'ON — the slow step' if do_langid else 'off'})...", flush=True)
+          f"(language filter {'ON' if do_langid else 'off'})...", flush=True)
 
     if seen_src is None:
         seen_src = set()
     out: list[tuple[str, str]] = []
     n0 = n_leak = 0
+    t0 = time.time()
     for zh, en in pairs:
         n0 += 1
-        if n0 % 100000 == 0:
+        if n0 % 20000 == 0:
+            el = time.time() - t0
+            rate = n0 / max(el, 0.1)
+            eta_m = (total - n0) / max(rate, 1) / 60.0
             print(f"[{tag}] {n0:,}/{total:,} ({100.0*n0/total:4.1f}%), "
-                  f"{len(out):,} kept", flush=True)
+                  f"{len(out):,} kept, {rate:,.0f}/s, ETA {eta_m:5.1f} min", flush=True)
         zh, en = zh.strip(), en.strip()
         if not zh or not en:
             continue
@@ -250,7 +314,7 @@ def clean(pairs: Iterable[tuple[str, str]], do_langid: bool,
         # 3. language id
         if do_langid and not langid_ok(zh, en, detector):
             continue
-        # 4. normalize (NFC + strip control + collapse whitespace) — BEFORE dedup
+        # 4. normalize (NFC + strip control + collapse whitespace)
         zh_n, en_n = normalize(zh), normalize(en)
         if not zh_n or not en_n:
             continue
@@ -258,7 +322,7 @@ def clean(pairs: Iterable[tuple[str, str]], do_langid: bool,
         if exclude_src and (zh_n in exclude_src or en_n in exclude_src):
             n_leak += 1
             continue
-        # 5. dedup on the NORMALIZED source (GLOBAL when seen_src is shared)
+        # 5. dedup on the normalized source (global when seen_src is shared)
         if zh_n in seen_src:
             continue
         seen_src.add(zh_n)
@@ -272,6 +336,8 @@ def clean(pairs: Iterable[tuple[str, str]], do_langid: bool,
 
 def build_test_source_index() -> set[str]:
     idx: set[str] = set()
+    print("[leakage] indexing WMT / FLORES+ test sentences "
+          "...", flush=True)
     try:
         from sacrebleu.utils import get_source_file, get_reference_files
         for ts in (C.DATA["wmt_testset"], C.DATA["wmt_testset_alt"]):
@@ -335,8 +401,8 @@ def write_manifest(train_path: str, dev_path: str, counts: dict) -> None:
     with open(os.path.join(C.DATA_DIR, "data_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(man, f, indent=2, ensure_ascii=False)
     print("\n" + "=" * 70)
-    print(" DATA MANIFEST — share train_sha256_16 with your team.")
-    print(" Every member MUST see the same hash, or their checkpoints are incompatible.")
+    print(" Share train_sha256_16 with your team.")
+    print(" When continuing, must see the same hash, or their checkpoints are incompatible.")
     print("=" * 70)
     for k, v in man.items():
         print(f"  {k}: {v}")
@@ -363,7 +429,6 @@ def main() -> None:
         return
 
     counts: dict = {}
-
     if C.SMOKE:
         n = C.SMOKE_OVERRIDES["sample_pairs"]
         sources = [("opensubtitles", load_opensubtitles(n, C.SEED), False)]
