@@ -15,6 +15,8 @@ from typing import Any
 SEED = 191
 EVAL_SEEDS = [191]
 SELECTED_ARCH = "arch4_transformer"
+LANGID_VERIFY_LONG_EN = True
+LANGID_MIN_EN_CHARS = 40
 DEV_SIZE = 3000
 PAD_ID, UNK_ID, BOS_ID, EOS_ID = 0, 1, 2, 3
 LANG_TOKENS = ["<zh>", "<en>"]
