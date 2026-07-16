@@ -57,7 +57,7 @@ DATA = {
         "version": "v2018",
         "l1": "en",
         "l2": "zh_cn",
-        "sample": 2_500_000,
+        "sample": 3_500_000,
     },
     # TED2020 v1 (OPUS) a spoken register, volunteer-translated TED/TEDx transcripts.
     "ted2020": {
