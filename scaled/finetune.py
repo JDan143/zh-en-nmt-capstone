@@ -25,6 +25,13 @@ train.MODEL_MODULES["arch5_improved_transformer"] = "models.arch5_improved_trans
 
 ARCH = "arch5_improved_transformer"
 
+def lr_tag(lr: float) -> str:
+    return f"{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+
+
+def run_tag(lr: float, patience: int) -> str:
+    return f"lr{lr_tag(lr)}_p{patience}"
+
 
 def ft_root() -> str:
     return os.environ.get("SPEECHBRIDGE_FT",
@@ -104,7 +111,6 @@ def main():
     preflight(base_ckpt, paths)
 
     cfg = C.get_arch_config(ARCH)
-    # Fine-tune overrides: constant low LR, no warmup, no teacher-forcing anneal.
     cfg.scheduler = "none"
     cfg.lr = args.lr
     cfg.epochs = args.epochs
@@ -132,12 +138,14 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     print(f"[ft] AMP {'on' if use_amp else 'off'} | constant LR {cfg.lr} | patience {cfg.patience}")
 
+    tag = run_tag(cfg.lr, cfg.patience)
     os.environ["SPEECHBRIDGE_RESULTS"] = paths["results"]
-    logger = MetricsLogger(os.path.join(paths["results"], f"metrics_log_ft_arch5_seed{args.seed}.csv"))
-    best_path = os.path.join(paths["ckpt"], f"{ARCH}_ft_seed{args.seed}_best.pt")
-    last_path = os.path.join(paths["ckpt"], f"{ARCH}_ft_seed{args.seed}_last.pt")
+    logger = MetricsLogger(os.path.join(
+        paths["results"], f"metrics_log_ft_arch5_seed{args.seed}_{tag}.csv"))
+    best_path = os.path.join(paths["ckpt"], f"{ARCH}_ft_seed{args.seed}_{tag}_best.pt")
+    last_path = os.path.join(paths["ckpt"], f"{ARCH}_ft_seed{args.seed}_{tag}_last.pt")
 
-    lock = acquire_lock(ARCH + "_ft", args.seed, args.owner, force=args.force)
+    lock = acquire_lock(ARCH + "_ft_" + tag, args.seed, args.owner, force=args.force)
 
     start_epoch, best_dev, bad_epochs = 0, math.inf, 0
     if os.path.exists(last_path) and not args.fresh:
@@ -196,7 +204,8 @@ def main():
             atomic_save({"model_state": model.state_dict(), "arch": ARCH,
                          "cfg": cfg.to_dict(), "vocab_size": vocab_size,
                          "seed": args.seed, "epoch": epoch, "dev_loss": dev_loss,
-                         "finetuned": True,
+                         "finetuned": True, "ft_lr": cfg.lr, "ft_patience": cfg.patience,
+                         "run_tag": tag,
                          "base_ckpt": os.path.basename(base_ckpt)}, best_path)
         atomic_save({"model_state": model.state_dict(),
                      "optimizer_state": optimizer.state_dict(),
@@ -204,7 +213,8 @@ def main():
                      "rng": capture_rng(), "arch": ARCH, "cfg": cfg.to_dict(),
                      "vocab_size": vocab_size, "seed": args.seed, "epoch": epoch,
                      "best_dev": best_dev, "bad_epochs": bad_epochs,
-                     "owner": args.owner, "finetuned": True}, last_path)
+                     "owner": args.owner, "finetuned": True, "ft_lr": cfg.lr,
+                     "ft_patience": cfg.patience, "run_tag": tag}, last_path)
 
         if bad_epochs >= cfg.patience:
             print(f"[ft] stopping. Dev loss has not improved for {cfg.patience} epochs.")
