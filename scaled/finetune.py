@@ -29,8 +29,9 @@ def lr_tag(lr: float) -> str:
     return f"{lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
 
 
-def run_tag(lr: float, patience: int) -> str:
-    return f"lr{lr_tag(lr)}_p{patience}"
+def run_tag(lr: float, patience: int, general_mix: int = 0) -> str:
+    base = f"lr{lr_tag(lr)}_p{patience}"
+    return f"{base}_mix{general_mix}" if general_mix > 0 else base
 
 
 def ft_root() -> str:
@@ -66,12 +67,57 @@ def preflight(base_ckpt: str, paths: dict) -> None:
               "test set to measure the hospitality gain later.")
 
 
-def make_ft_loaders(cfg, sp, paths):
+def reservoir_sample_general(path: str, k: int, seed: int) -> list:
+    """Pull k random (zh, en) pairs from the big general train file without loading all of
+    it into memory. Reservoir sampling reads the gzip stream once and keeps a uniform
+    random k. Same seed gives the same sample every run, so results are reproducible.
+    """
+    import gzip
+    import random
+    rng = random.Random(seed)
+    keep = []
+    n = 0
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                continue
+            n += 1
+            if len(keep) < k:
+                keep.append((parts[0], parts[1]))
+            else:
+                j = rng.randint(0, n - 1)
+                if j < k:
+                    keep[j] = (parts[0], parts[1])
+    return keep
+
+
+def make_ft_loaders(cfg, sp, paths, general_mix: int, general_path: str, seed: int):
     tr = os.path.join(paths["data"], "ft_train.tsv.gz")
     dv = os.path.join(paths["data"], "ft_dev.tsv.gz")
     train_ds = TranslationDataset(tr, sp, max_subword_len=cfg.max_len)
     dev_ds = TranslationDataset(dv, sp, max_subword_len=cfg.max_len)
-    print(f"[ft] train pairs {len(train_ds):,}  dev pairs {len(dev_ds):,}")
+
+    if general_mix > 0:
+        n_hosp_pairs = len(train_ds.items) // 2
+        n_general_pairs = general_mix * n_hosp_pairs
+        if not os.path.exists(general_path):
+            raise SystemExit(f"[ft] --general-mix needs the general train file: {general_path}")
+        print(f"[ft] mixed fine-tuning 1:{general_mix}. Sampling {n_general_pairs:,} "
+              f"general pairs from {general_path} ...")
+        gen_pairs = reservoir_sample_general(general_path, n_general_pairs, seed)
+        gen_ds = TranslationDataset(tr, sp, max_subword_len=cfg.max_len)  # temp shell
+        gen_ds.items = []
+        for zh, en in gen_pairs:
+            gen_ds.items.append((train_ds.tag["en"], zh, en, "zh-en"))
+            gen_ds.items.append((train_ds.tag["zh"], en, zh, "en-zh"))
+        train_ds.items = train_ds.items + gen_ds.items
+        train_ds._lengths = None
+        print(f"[ft] blended train: {n_hosp_pairs:,} hospitality + {len(gen_pairs):,} "
+              f"general = {len(train_ds.items):,} directional examples")
+    else:
+        print(f"[ft] train pairs {len(train_ds):,}  dev pairs {len(dev_ds):,}")
+
     if cfg.batch_by_tokens:
         sampler = MaxTokensBatchSampler(train_ds, cfg.max_tokens, shuffle=True, seed=C.SEED)
         train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate)
@@ -98,6 +144,13 @@ def main():
                     help="hard cap only; early stopping normally ends the run first.")
     ap.add_argument("--patience", type=int, default=5,
                     help="stop after this many epochs with no dev improvement.")
+    ap.add_argument("--general-mix", type=int, default=4,
+                    help="mixed fine-tuning ratio: general pairs blended in per hospitality "
+                         "pair (Chu et al. 2017). 4 means 1 hospitality : 4 general. Set 0 "
+                         "for hospitality-only training.")
+    ap.add_argument("--general-file", default=None,
+                    help="the general train file to sample from "
+                         "(default: <scaled data>/train.tsv.gz)")
     ap.add_argument("--base-ckpt", default=None,
                     help="the scaled Arch 5 model to start from "
                          "(default: checkpoints/arch5_improved_transformer_seed{seed}_best.pt)")
@@ -120,7 +173,9 @@ def main():
 
     sp = load_tokenizer()
     vocab_size = sp.get_piece_size()
-    train_loader, dev_loader = make_ft_loaders(cfg, sp, paths)
+    general_path = args.general_file or os.path.join(C.DATA_DIR, "train.tsv.gz")
+    train_loader, dev_loader = make_ft_loaders(cfg, sp, paths, args.general_mix,
+                                               general_path, args.seed)
     train_sampler = getattr(train_loader, "batch_sampler", None)
 
     mod = importlib.import_module(train.MODEL_MODULES[ARCH])
@@ -136,9 +191,10 @@ def main():
 
     use_amp = device.type == "cuda" and cfg.amp_safe
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    print(f"[ft] AMP {'on' if use_amp else 'off'} | constant LR {cfg.lr} | patience {cfg.patience}")
+    mix_desc = f"mixed 1:{args.general_mix}" if args.general_mix > 0 else "hospitality-only"
+    print(f"[ft] AMP {'on' if use_amp else 'off'} | constant LR {cfg.lr} | patience {cfg.patience} | {mix_desc}")
 
-    tag = run_tag(cfg.lr, cfg.patience)
+    tag = run_tag(cfg.lr, cfg.patience, args.general_mix)
     os.environ["SPEECHBRIDGE_RESULTS"] = paths["results"]
     logger = MetricsLogger(os.path.join(
         paths["results"], f"metrics_log_ft_arch5_seed{args.seed}_{tag}.csv"))
@@ -205,7 +261,7 @@ def main():
                          "cfg": cfg.to_dict(), "vocab_size": vocab_size,
                          "seed": args.seed, "epoch": epoch, "dev_loss": dev_loss,
                          "finetuned": True, "ft_lr": cfg.lr, "ft_patience": cfg.patience,
-                         "run_tag": tag,
+                         "general_mix": args.general_mix, "run_tag": tag,
                          "base_ckpt": os.path.basename(base_ckpt)}, best_path)
         atomic_save({"model_state": model.state_dict(),
                      "optimizer_state": optimizer.state_dict(),
@@ -214,7 +270,8 @@ def main():
                      "vocab_size": vocab_size, "seed": args.seed, "epoch": epoch,
                      "best_dev": best_dev, "bad_epochs": bad_epochs,
                      "owner": args.owner, "finetuned": True, "ft_lr": cfg.lr,
-                     "ft_patience": cfg.patience, "run_tag": tag}, last_path)
+                     "ft_patience": cfg.patience, "general_mix": args.general_mix,
+                     "run_tag": tag}, last_path)
 
         if bad_epochs >= cfg.patience:
             print(f"[ft] stopping. Dev loss has not improved for {cfg.patience} epochs.")
