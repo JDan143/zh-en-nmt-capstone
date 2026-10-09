@@ -19,8 +19,8 @@ from models.common import build_criterion
 
 
 def estimate_fisher(model, loader, criterion, device, cfg, use_amp, max_batches):
-    """Diagonal Fisher: average of squared gradients of the loss over general data.
-    Larger value = that weight matters more to general translation, so protect it more.
+    """Diagonal fisher = mean squared gradient over some general batches.
+    big value means the weight matters for general translation, so ewc holds it closer.
     """
     import torch.nn as nn
     model.eval()
@@ -59,8 +59,8 @@ def ewc_penalty(model, fisher, star_params):
 
 def run_epoch_ewc(model, loader, criterion, ce_for_ppl, device, cfg, optimizer,
                   fisher, star_params, ewc_lambda, use_amp, scaler, max_batches=None):
-    """A training epoch with the EWC penalty added to the task loss. Mirrors the study
-    run_epoch (accumulation, clipping, AMP), plus the penalty term so backward sees it.
+    """Same as run_epoch in train.py (grad accumulation, clipping, amp) but adds the
+    ewc penalty to the loss before backward. run_epoch can't do that, hence the copy.
     """
     import torch.nn as nn  # noqa: F811
     model.train()
@@ -97,7 +97,7 @@ def run_epoch_ewc(model, loader, criterion, ce_for_ppl, device, cfg, optimizer,
         if pending == accum:
             step(); pending = 0
         n_tok = (tgt_out != C.PAD_ID).sum().item()
-        total_loss += task_loss.item() * n_tok  # log the TASK loss, not task+penalty
+        total_loss += task_loss.item() * n_tok  # log task loss only, penalty not included
         total_ce += ce.item() * n_tok
         total_tok += n_tok
     if pending > 0:
@@ -155,13 +155,12 @@ def preflight(base_ckpt: str, paths: dict) -> None:
     if missing:
         raise SystemExit("[ft] can't start:\n  " + "\n  ".join(missing))
     if not os.path.exists(os.path.join(paths["data"], "ft_test.tsv.gz")):
-        print("[ft] warning: no ft_test.tsv.gz, need it for eval later")
+        print("[ft] heads up: ft_test.tsv.gz is missing, you need it for eval later")
 
 
 def reservoir_sample_general(path: str, k: int, seed: int) -> list:
-    """Pull k random (zh, en) pairs from the big general train file without loading all of
-    it into memory. Reservoir sampling reads the gzip stream once and keeps a uniform
-    random k. Same seed gives the same sample every run, so results are reproducible.
+    """Grab k random pairs from the 3.34M general file in one pass (reservoir sampling),
+    so we don't have to load the whole thing. same seed = same sample every run.
     """
     import gzip
     import random
@@ -202,7 +201,7 @@ def make_ft_loaders(cfg, sp, paths, general_mix: int, general_path: str, seed: i
             gen_ds.items.append((train_ds.tag["en"], zh, en, "zh-en"))
             gen_ds.items.append((train_ds.tag["zh"], en, zh, "en-zh"))
         train_ds.items = train_ds.items + gen_ds.items
-        train_ds._lengths = None  # recompute lengths over the blended set
+        train_ds._lengths = None  # lengths changed, recompute
         print(f"[ft] train: {n_hosp_pairs:,} hosp + {len(gen_pairs):,} general "
               f"({len(train_ds.items):,} w/ both directions)")
     else:
@@ -218,41 +217,85 @@ def make_ft_loaders(cfg, sp, paths, general_mix: int, general_path: str, seed: i
     return train_loader, dev_loader
 
 
+def read_pairs(path: str) -> list:
+    """Read zh<TAB>en pairs. works for .tsv and .tsv.gz (looks at the bytes, not the name)."""
+    import gzip
+    with open(path, "rb") as f:
+        is_gz = f.read(2) == b"\x1f\x8b"
+    opener = gzip.open if is_gz else open
+    pairs = []
+    with opener(path, "rt", encoding="utf-8") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 2 and parts[0] and parts[1]:
+                pairs.append((parts[0], parts[1]))
+    return pairs
+
+
+def make_general_dev_loader(cfg, sp, paths, path: str, size: int):
+    """General dev set for the forgetting check. it's the base model's own dev split,
+    which it never trained on. if size > 0 we sample with seed 191 (not the run seed)
+    so every run gets checked on the same sentences.
+    """
+    import random
+    if not os.path.exists(path):
+        raise SystemExit(f"[ft] can't find the general dev file: {path}\n"
+                         f"     use --general-dev to point at the base dev set (data/dev.tsv.gz)")
+    pairs = read_pairs(path)
+    if size and size < len(pairs):
+        pairs = random.Random(191).sample(pairs, size)
+    ds = TranslationDataset(os.path.join(paths["data"], "ft_dev.tsv.gz"), sp,
+                            max_subword_len=cfg.max_len)
+    ds.items = []
+    for zh, en in pairs:
+        ds.items.append((ds.tag["en"], zh, en, "zh-en"))
+        ds.items.append((ds.tag["zh"], en, zh, "en-zh"))
+    ds._lengths = None
+    print(f"[ft] general dev: {len(pairs):,} pairs from {os.path.basename(path)}")
+    return DataLoader(ds, batch_size=64, shuffle=False, collate_fn=collate)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Hospitality fine-tuning for the scaled Arch 5 model.")
     ap.add_argument("--seed", type=int, default=getattr(C, "SEED", 191))
     ap.add_argument("--owner", default=os.environ.get("SPEECHBRIDGE_OWNER", "unknown"))
     ap.add_argument("--force", action="store_true",
-                    help="take over a stale lock (the previous member has stopped)")
+                    help="take over a stale lock, only if whoever had it is done")
     ap.add_argument("--fresh", action="store_true",
-                    help="restart from the base model, ignoring any fine-tune checkpoint")
+                    help="start over from the base model and ignore any saved fine-tune checkpoint")
     ap.add_argument("--lr", type=float, default=5e-5,
-                    help="constant fine-tune LR. Small on purpose. Drop to 3e-5 if the "
-                         "general WMT/FLORES scores regress; try 1e-4 if hospitality "
-                         "barely moves after several epochs.")
+                    help="constant lr, kept small on purpose. go lower if wmt/flores "
+                         "drops too much, higher if hospitality barely moves.")
     ap.add_argument("--epochs", type=int, default=100,
-                    help="hard cap only; early stopping normally ends the run first.")
+                    help="max epochs. early stopping usually kicks in way before this")
     ap.add_argument("--patience", type=int, default=5,
-                    help="stop after this many epochs with no dev improvement.")
+                    help="stop after this many epochs without a new best")
     ap.add_argument("--general-mix", type=int, default=4,
-                    help="mixed fine-tuning ratio: general pairs blended in per hospitality "
-                         "pair (Chu et al. 2017). 4 means 1 hospitality : 4 general. Set 0 "
-                         "for hospitality-only training.")
+                    help="for --method mixed: general pairs per hospitality pair "
+                         "(Chu et al. 2017). 4 means 1:4. 0 = hospitality only")
     ap.add_argument("--general-file", default=None,
-                    help="the general train file to sample from "
-                         "(default: <scaled data>/train.tsv.gz)")
+                    help="general train file to sample from "
+                         "(default <scaled data>/train.tsv.gz)")
     ap.add_argument("--method", choices=["plain", "mixed", "ewc"], default="mixed",
-                    help="plain = hospitality only; mixed = blend general data in "
-                         "(Chu 2017); ewc = penalize moving weights important to the "
-                         "general task (Kirkpatrick 2017 / Thompson 2019).")
+                    help="plain: hospitality data only. mixed: add general pairs to each "
+                         "epoch (Chu et al. 2017). ewc: penalize changes to weights the "
+                         "general model relies on (Kirkpatrick et al. 2017, Thompson et al. 2019)")
     ap.add_argument("--ewc-lambda", type=float, default=5000.0,
-                    help="EWC penalty strength. Higher protects general translation more "
-                         "but adapts less. Typical range 1000 to 50000; tune it like LR.")
+                    help="ewc strength. higher = less forgetting but less adaptation. "
+                         "we tried 5000 and 20000, 20000 forgot less")
     ap.add_argument("--fisher-batches", type=int, default=200,
-                    help="how many general batches to estimate the Fisher information from.")
+                    help="number of general batches used for the fisher estimate")
+    ap.add_argument("--general-dev", default=None,
+                    help="general dev set, scored every epoch to catch forgetting "
+                         "(default <scaled data>/dev.tsv.gz, the base model's dev split)")
+    ap.add_argument("--general-dev-size", type=int, default=0,
+                    help="only use this many general dev pairs (fixed sample). 0 = use all")
+    ap.add_argument("--max-general-drop", type=float, default=0.02,
+                    help="an epoch can only be saved as best if its general dev loss is at "
+                         "most this much worse than the base (0.02 = 2%%). 1 turns it off")
     ap.add_argument("--base-ckpt", default=None,
-                    help="the scaled Arch 5 model to start from "
-                         "(default: checkpoints/arch5_improved_transformer_seed{seed}_best.pt)")
+                    help="scaled arch 5 checkpoint to start from "
+                         "(default checkpoints/arch5_improved_transformer_seed{seed}_best.pt)")
     args = ap.parse_args()
 
     seed_everything(args.seed)
@@ -278,6 +321,9 @@ def main():
     train_loader, dev_loader = make_ft_loaders(cfg, sp, paths, effective_mix,
                                                general_path, args.seed)
     train_sampler = getattr(train_loader, "batch_sampler", None)
+    general_dev_path = args.general_dev or os.path.join(C.DATA_DIR, "dev.tsv.gz")
+    gen_dev_loader = make_general_dev_loader(cfg, sp, paths, general_dev_path,
+                                             args.general_dev_size)
 
     mod = importlib.import_module(train.MODEL_MODULES[ARCH])
     model = mod.build(cfg, vocab_size).to(device)
@@ -298,18 +344,27 @@ def main():
         method_desc = f"ewc lambda={args.ewc_lambda:g}"
     else:
         method_desc = "plain"
-    print(f"[ft] amp={use_amp} lr={cfg.lr} patience={cfg.patience} method={method_desc}")
+    print(f"[ft] amp={use_amp} lr={cfg.lr} patience={cfg.patience} method={method_desc} "
+          f"general guard={args.max_general_drop:.0%}")
 
     tag = run_tag(cfg.lr, cfg.patience, args.method, args.general_mix, args.ewc_lambda)
     os.environ["SPEECHBRIDGE_RESULTS"] = paths["results"]
-    logger = MetricsLogger(os.path.join(
-        paths["results"], f"metrics_log_ft_arch5_seed{args.seed}_{tag}.csv"))
+    log_path = os.path.join(paths["results"], f"metrics_log_ft_arch5_seed{args.seed}_{tag}.csv")
+    if os.path.exists(log_path):
+        with open(log_path, encoding="utf-8") as f:
+            header = f.readline()
+        if "gen_dev_loss" not in header:
+            # old log has no general columns, keep it but start a new file
+            os.replace(log_path, log_path.replace(".csv", "_before_general_check.csv"))
+            print("[ft] moved the old metrics log to *_before_general_check.csv")
+    logger = MetricsLogger(log_path)
     best_path = os.path.join(paths["ckpt"], f"{ARCH}_ft_seed{args.seed}_{tag}_best.pt")
     last_path = os.path.join(paths["ckpt"], f"{ARCH}_ft_seed{args.seed}_{tag}_last.pt")
 
     lock = acquire_lock(ARCH + "_ft_" + tag, args.seed, args.owner, force=args.force)
 
     start_epoch, best_dev, bad_epochs = 0, math.inf, 0
+    base_gen = None
     if os.path.exists(last_path) and not args.fresh:
         ck = torch.load(last_path, map_location=device, weights_only=False)
         model.load_state_dict(ck["model_state"])
@@ -321,6 +376,7 @@ def main():
         start_epoch = ck["epoch"] + 1
         best_dev = ck["best_dev"]
         bad_epochs = ck["bad_epochs"]
+        base_gen = ck.get("base_gen_dev")
         print(f"[ft] resuming at epoch {start_epoch} (was {ck.get('owner', '?')}, "
               f"now {args.owner}), best dev {best_dev:.4f}, bad {bad_epochs}/{cfg.patience}")
     else:
@@ -331,6 +387,20 @@ def main():
         base_dev, base_ce = run_epoch(model, dev_loader, criterion, ce_for_ppl, device,
                                       cfg, train=False, scaler=scaler, use_amp=use_amp)
         print(f"[ft] baseline dev {base_dev:.4f} (ppl {math.exp(min(base_ce, 20)):.2f})")
+        base_gen, _ = run_epoch(model, gen_dev_loader, criterion, ce_for_ppl, device,
+                                cfg, train=False, scaler=scaler, use_amp=use_amp)
+        print(f"[ft] baseline general dev {base_gen:.4f}")
+
+    if base_gen is None:
+        # resuming a run from before the general check, so no baseline was saved
+        print("[ft] checkpoint has no general baseline, scoring the base model first")
+        tmp = mod.build(cfg, vocab_size).to(device)
+        tmp.load_state_dict(torch.load(base_ckpt, map_location=device,
+                                       weights_only=False)["model_state"])
+        base_gen, _ = run_epoch(tmp, gen_dev_loader, criterion, ce_for_ppl, device,
+                                cfg, train=False, scaler=scaler, use_amp=use_amp)
+        del tmp
+        print(f"[ft] baseline general dev {base_gen:.4f}")
 
     fisher, star_params = None, None
     if args.method == "ewc":
@@ -368,7 +438,14 @@ def main():
         dev_loss, dev_ce = run_epoch(model, dev_loader, criterion, ce_for_ppl, device,
                                      cfg, train=False, scaler=scaler, use_amp=use_amp)
         ppl = math.exp(min(dev_ce, 20))
-        improved = dev_loss < best_dev - 1e-4
+        gen_loss, _ = run_epoch(model, gen_dev_loader, criterion, ce_for_ppl, device,
+                                cfg, train=False, scaler=scaler, use_amp=use_amp)
+        gen_change = gen_loss / base_gen - 1.0
+        gen_ok = gen_change <= args.max_general_drop
+        # only epochs that stay within the general limit can be the new best.
+        # going over the limit also counts toward patience, so a run that keeps
+        # forgetting stops on its own.
+        improved = gen_ok and dev_loss < best_dev - 1e-4
         if improved:
             best_dev, bad_epochs = dev_loss, 0
         else:
@@ -376,10 +453,15 @@ def main():
 
         logger.log({"arch": ARCH + "_ft", "seed": args.seed, "epoch": epoch,
                     "train_loss": round(tr_loss, 4), "dev_loss": round(dev_loss, 4),
-                    "dev_perplexity": round(ppl, 3), "epoch_time_s": round(t.elapsed, 2),
+                    "dev_perplexity": round(ppl, 3), "gen_dev_loss": round(gen_loss, 4),
+                    "gen_change_pct": round(100 * gen_change, 2),
+                    "epoch_time_s": round(t.elapsed, 2),
                     "lr": cfg.lr, "params_M": human_millions(count_params(model))})
+        mark = "*" if improved else f"{bad_epochs}/{cfg.patience}"
+        if not gen_ok:
+            mark += "  (general over the limit, not saved)"
         print(f"[ft] epoch {epoch}: train {tr_loss:.4f}  dev {dev_loss:.4f} "
-              f"(ppl {ppl:.2f})  {'*' if improved else f'{bad_epochs}/{cfg.patience}'}")
+              f"(ppl {ppl:.2f})  general {gen_loss:.4f} ({100 * gen_change:+.1f}%)  {mark}")
 
         if improved:
             atomic_save({"model_state": model.state_dict(), "arch": ARCH,
@@ -388,6 +470,9 @@ def main():
                          "finetuned": True, "ft_lr": cfg.lr, "ft_patience": cfg.patience,
                          "general_mix": args.general_mix, "method": args.method,
                          "ewc_lambda": args.ewc_lambda, "run_tag": tag,
+                         "gen_dev_loss": gen_loss, "base_gen_dev": base_gen,
+                         "gen_change": gen_change, "max_general_drop": args.max_general_drop,
+                         "general_dev": os.path.basename(general_dev_path),
                          "base_ckpt": os.path.basename(base_ckpt)}, best_path)
         atomic_save({"model_state": model.state_dict(),
                      "optimizer_state": optimizer.state_dict(),
@@ -398,6 +483,7 @@ def main():
                      "owner": args.owner, "finetuned": True, "ft_lr": cfg.lr,
                      "ft_patience": cfg.patience, "general_mix": args.general_mix,
                      "method": args.method, "ewc_lambda": args.ewc_lambda,
+                     "base_gen_dev": base_gen, "max_general_drop": args.max_general_drop,
                      "run_tag": tag}, last_path)
 
         if bad_epochs >= cfg.patience:
@@ -405,8 +491,13 @@ def main():
             break
 
     release_lock(lock)
-    print(f"[ft] done, best dev {best_dev:.4f} -> {best_path}")
-    print("[ft] todo: eval on hosp test + rerun wmt/flores (if general drops >1pt, lower lr)")
+    if math.isinf(best_dev):
+        print(f"[ft] finished but nothing saved: every epoch was more than "
+              f"{args.max_general_drop:.0%} worse than the base on general dev.\n"
+              f"     try a lower --lr or a higher --ewc-lambda")
+    else:
+        print(f"[ft] done, best dev {best_dev:.4f} -> {best_path}")
+    print("[ft] next: run the wmt/flores eval and the hospitality test (cells 7 and 8)")
 
 
 if __name__ == "__main__":
