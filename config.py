@@ -172,7 +172,7 @@ ARCH_CONFIGS: dict[str, ArchConfig] = {
         optimizer="adam", lr=1e-3, grad_clip=1.0,
         scheduler="plateau",          # adaptive LR: halve on dev-loss plateau
         batch_size=128,               # epochs/patience use the open-ended defaults
-        teacher_forcing=True, tf_start=1.0, tf_end=0.5, tf_decay_epochs=20,
+        teacher_forcing=True, tf_start=1.0, tf_end=1.0, tf_decay_epochs=20,
     ),
     # Arch 2 — LSTM Seq2Seq + Luong attention (dot/general/concat; general primary)
     "arch2_lstm": ArchConfig(
