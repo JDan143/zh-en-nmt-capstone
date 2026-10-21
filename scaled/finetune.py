@@ -9,8 +9,12 @@ run from scaled/:
     python finetune.py test                    ft_test + WMT + FLORES+, winner and base only
 
 method, lr, ewc lambda, mix ratio, interpolation alpha and which epoch to keep are all
-picked on dev. ft_test, WMT and FLORES+ get scored once, by `test`, on the selected
-model and the base.
+picked on dev. ft_test, WMT and FLORES+ devtest get scored once, by `test`, on the
+selected model and the base.
+
+the rule holds a list of learning rates. the general guard and the selection look at
+the held-out dev of the base corpus and at FLORES+ dev (an outside general set, kept in
+data/), each direction on its own. mixed runs take a different general slice each epoch.
 
 paths come from env vars (the notebook sets them):
     SPEECHBRIDGE_ROOT   speechbridge_scaled/
@@ -43,6 +47,10 @@ BASE_SEED = 191          # the pretraining run we fine-tune from
 SELECTION_SEED = 191     # only seed 191 runs compete in selection
 REPLICATE_SEEDS = (1604, 4090)
 EXPECTED_CONVLAB = 7412  # ConvLab-2 rows in train_meta.tsv: 3,821 CrossWOZ + 3,591 MultiWOZ
+# per-direction general sets the guard and the selection watch. gen = held-out dev of
+# the base corpus, ood = FLORES+ dev. an average over directions or over sets could
+# hide a drop in one of them, so each is checked on its own.
+GUARD_SETS = ("gen_zhen", "gen_enzh", "ood_zhen", "ood_enzh")
 
 
 def _set_dir_defaults():
@@ -265,9 +273,68 @@ def reservoir_sample(path, k, seed) -> list:
     return keep
 
 
-def eval_loader(pairs, sp, cfg):
-    return DataLoader(PairsDataset(pairs, sp, cfg.max_len), batch_size=64,
+def eval_loader(pairs, sp, cfg, directions=("zh-en", "en-zh")):
+    return DataLoader(PairsDataset(pairs, sp, cfg.max_len, directions), batch_size=64,
                       shuffle=False, collate_fn=collate)
+
+
+def ood_dev_pairs(d) -> list:
+    """FLORES+ dev, the outside general set. devtest stays for the final test, so this
+    is a different set of sentences from the same source. downloaded once into data/
+    so every run and every session reads the same file."""
+    p = os.path.join(d["data"], "flores_dev.tsv.gz")
+    if not os.path.exists(p):
+        from evaluate import load_flores
+        f = C.DATA["flores"]
+        old = f["split"]
+        f["split"] = "dev"   # load_flores reads the split from config
+        try:
+            fl = load_flores()
+        finally:
+            f["split"] = old
+        zh, en = fl["zh-en"]
+        clean = lambda s: " ".join(s.split())  # noqa: E731  (no tabs or newlines in the tsv)
+        tmp = p + ".part"
+        with gzip.open(tmp, "wt", encoding="utf-8") as g:
+            for a, b in zip(zh, en):
+                g.write(f"{clean(a)}\t{clean(b)}\n")
+        os.replace(tmp, p)
+        print(f"[ft] saved FLORES+ dev, {len(zh)} pairs, to {p}")
+    return read_pairs(p)
+
+
+def guard_loaders(d, sp, cfg) -> dict:
+    """one loader per general set and direction, so a drop in one direction can't hide
+    behind the other one in an average"""
+    gen, ood = read_pairs(d["general_dev"]), ood_dev_pairs(d)
+    return {"gen_zhen": eval_loader(gen, sp, cfg, ("zh-en",)),
+            "gen_enzh": eval_loader(gen, sp, cfg, ("en-zh",)),
+            "ood_zhen": eval_loader(ood, sp, cfg, ("zh-en",)),
+            "ood_enzh": eval_loader(ood, sp, cfg, ("en-zh",))}
+
+
+class EpochMix:
+    """mixed fine-tuning data. the general pool holds mix_pool epochs' worth of pairs and
+    each epoch takes the next slice, so a run of E epochs sees each general pair about
+    E / mix_pool times rather than once per epoch."""
+
+    def __init__(self, hosp, pool, k, sp, cfg, seed):
+        self.hosp = PairsDataset(hosp, sp, cfg.max_len)
+        self.pool = PairsDataset(pool, sp, cfg.max_len)
+        self.hosp.lengths()
+        self.pool.lengths()
+        self.k, self.sp, self.cfg, self.seed = k, sp, cfg, seed
+        self.n_slices = max(1, len(pool) // max(k, 1))
+
+    def loader(self, epoch):
+        s = epoch % self.n_slices
+        lo, hi = 2 * s * self.k, 2 * (s + 1) * self.k   # 2 items per pair, one per direction
+        ds = PairsDataset([], self.sp, self.cfg.max_len)
+        ds.items = self.hosp.items + self.pool.items[lo:hi]
+        ds._lengths = self.hosp._lengths + self.pool._lengths[lo:hi]
+        sampler = MaxTokensBatchSampler(ds, self.cfg.max_tokens, shuffle=True, seed=self.seed)
+        sampler.set_epoch(epoch)
+        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate)
 
 
 # ---------------------------------------------------------------- model ----
@@ -309,8 +376,8 @@ def estimate_fisher(model, pairs, sp, cfg, criterion, device, n_batches, seed):
     """diagonal fisher at the base weights: mean squared gradient of the training loss
     over some general batches. a big value means the weight matters for general
     translation, so ewc holds it closer. fp32 so small grads don't underflow.
-    batches are max_tokens batches like in training. fixed batches of 128 padded to the
-    longest sentence ran out of memory in the smoke test (fp32 logits alone can pass 4 GB)."""
+    batches are max_tokens batches like in training. a fixed 128 sentences padded to the
+    longest one can need over 4 GB for the fp32 logits alone."""
     model.eval()  # no dropout, we want the base model's own gradients
     ds = PairsDataset(pairs, sp, cfg.max_len)
     loader = DataLoader(ds, batch_sampler=MaxTokensBatchSampler(ds, cfg.max_tokens, seed=seed),
@@ -370,7 +437,7 @@ class EWCLoss(nn.Module):
 
 def score_texts(hyps, refs, out_lang) -> dict:
     """the one scoring function for every set (dev, ft_test, WMT, FLORES+).
-    same recipe as evaluate.py so base numbers line up with the earlier eval:
+    same recipe as evaluate.py so base numbers line up with the base model's own eval:
     BLEU tok=zh for Chinese output and 13a for English; chrF++ (word order 2), and for
     Chinese output chrF++ runs on text split into single characters."""
     from sacrebleu.metrics import BLEU, CHRF
@@ -435,7 +502,7 @@ def paired_bootstrap(hyps_base, hyps_new, refs, out_lang, n_samples=1000, seed=1
 
 
 def translate(model, cfg, sp, sources, out_lang, device, beam, limit=None):
-    # evaluate.translate_corpus, so decoding is identical to the earlier base eval
+    # evaluate.translate_corpus, so decoding is identical to the base model's own eval
     from evaluate import translate_corpus
     if limit:
         sources = sources[:limit]
@@ -453,12 +520,14 @@ def cmd_register_rule(args):
     d = ft_dirs()
     rule = {"pick": "highest mean hospitality dev chrF++ (mean of EN->ZH and ZH->EN, "
                     "natural-source lines only)",
-            "subject_to": "mean general dev BLEU drop vs base <= max_gen_bleu_drop",
-            "ties": "within tie_chrf of the best: take the smaller general BLEU drop",
+            "subject_to": "worst single BLEU drop vs base <= max_gen_bleu_drop, checked "
+                          "per direction on general dev and on FLORES+ dev",
+            "ties": "within tie_chrf of the best: take the smaller worst general BLEU drop",
             "max_gen_bleu_drop": args.max_gen_bleu_drop, "tie_chrf": args.tie,
-            "budget": {"lr": args.lr, "patience": args.patience, "gen_limit": args.gen_limit},
-            "candidates": {"mix": args.mix, "ewc_lambdas": args.ewc_lambdas,
-                           "alphas": args.alphas},
+            "budget": {"lrs": sorted(args.lrs), "patience": args.patience,
+                       "gen_limit": args.gen_limit},
+            "candidates": {"mix": args.mix, "mix_pool": args.mix_pool,
+                           "ewc_lambdas": args.ewc_lambdas, "alphas": args.alphas},
             "beam": args.beam}
     p = rule_path(d)
     if os.path.exists(p):
@@ -491,14 +560,21 @@ def load_rule(d):
         raise SystemExit("no selection_rule.json yet, the settings cell writes it "
                          "(finetune.py register-rule)")
     with open(p, encoding="utf-8") as f:
-        return json.load(f)
+        rule = json.load(f)
+    if "lrs" not in rule.get("budget", {}):
+        raise SystemExit(f"{p} has no budget.lrs, so this script can't use it. results/ "
+                         f"should start empty; the settings cell then writes the rule")
+    return rule
 
 
 # ---------------------------------------------------------------- train ----
 
 def cmd_train(args):
     d = ft_dirs()
-    load_rule(d)  # stops here if there is no rule yet
+    rule = load_rule(d)  # stops here if there is no rule yet
+    if not any(math.isclose(args.lr, x) for x in rule["budget"]["lrs"]):
+        print(f"[ft] lr {args.lr:g} isn't in the registered grid {rule['budget']['lrs']}, "
+              f"this run can't be selected")
     tag = run_tag(args.method, args.lr, args.patience, args.mix, args.ewc_lambda,
                   args.no_convlab)
     if args.expect_tag and args.expect_tag != tag:
@@ -508,6 +584,7 @@ def cmd_train(args):
                 "gen_limit": args.gen_limit, "mix": args.mix if args.method == "mixed" else 0,
                 "ewc_lambda": args.ewc_lambda if args.method == "ewc" else 0,
                 "fisher_batches": args.fisher_batches if args.method == "ewc" else 0,
+                "mix_pool": args.mix_pool if args.method == "mixed" else 0,
                 "no_convlab": args.no_convlab, "seed": args.seed}
     print(f"[ft] run {stem(args.seed, tag)}")
 
@@ -533,19 +610,34 @@ def cmd_train(args):
     hosp = read_pairs(os.path.join(d["data"], "ft_train.tsv.gz"))
     if args.no_convlab:
         hosp = drop_convlab(hosp, d)
-    train_pairs = list(hosp)
     if args.method == "mixed":
         k = args.mix * len(hosp)
-        print(f"[ft] sampling {k:,} general pairs ({args.mix} per hospitality pair) "
-              f"from {d['general_train']}, takes a minute or two...", flush=True)
-        train_pairs += reservoir_sample(d["general_train"], k, args.seed)
-    train_ds = PairsDataset(train_pairs, sp, cfg.max_len)
-    sampler = MaxTokensBatchSampler(train_ds, cfg.max_tokens, shuffle=True, seed=args.seed)
-    train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate)
+        n_pool = k * args.mix_pool
+        print(f"[ft] sampling a general pool of {n_pool:,} pairs ({args.mix} per hospitality pair "
+              f"x {args.mix_pool} epochs) from {d['general_train']}, takes a few minutes...",
+              flush=True)
+        pool = reservoir_sample(d["general_train"], n_pool, args.seed)
+        # reservoir slots that never got replaced keep file order, so shuffle before slicing
+        random.Random(args.seed).shuffle(pool)
+        mix = EpochMix(hosp, pool, k, sp, cfg, args.seed)
+        make_loader = mix.loader
+        n_examples = 2 * (len(hosp) + min(k, len(pool)))
+        print(f"[ft] general pool split into {mix.n_slices} slice(s) of {k:,} pairs, epoch e "
+              f"uses slice e % {mix.n_slices}")
+    else:
+        train_ds = PairsDataset(hosp, sp, cfg.max_len)
+        sampler = MaxTokensBatchSampler(train_ds, cfg.max_tokens, shuffle=True, seed=args.seed)
+        train_loader = DataLoader(train_ds, batch_sampler=sampler, collate_fn=collate)
+
+        def make_loader(epoch):
+            sampler.set_epoch(epoch)
+            return train_loader
+        n_examples = len(train_ds)
     hosp_dev_loader = eval_loader(read_pairs(os.path.join(d["data"], "ft_dev.tsv.gz")), sp, cfg)
-    gen_dev_loader = eval_loader(read_pairs(d["general_dev"]), sp, cfg)
-    print(f"[ft] train {len(hosp):,} hospitality pairs + {len(train_pairs) - len(hosp):,} general "
-          f"= {len(train_ds):,} examples (both directions)")
+    guards = guard_loaders(d, sp, cfg)
+    print(f"[ft] train {len(hosp):,} hospitality pairs + "
+          f"{n_examples // 2 - len(hosp):,} general per epoch = {n_examples:,} examples "
+          f"(both directions)")
 
     model = build_model(cfg, vocab_size).to(device)
     print(f"[ft] {ARCH}, {human_millions(count_params(model))}M params, method {args.method}, "
@@ -569,15 +661,23 @@ def cmd_train(args):
                 print(f"[ft] --fresh: moved old {os.path.basename(files[k])} aside")
     try:
         _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, model,
-                    criterion, ce, optimizer, scaler, use_amp, train_loader, sampler,
-                    hosp_dev_loader, gen_dev_loader, device, max_batches, lock)
+                    criterion, ce, optimizer, scaler, use_amp, make_loader,
+                    hosp_dev_loader, guards, device, max_batches, lock)
     finally:
         release_lock(lock)
 
 
+def _guard_ces(model, guards, criterion, ce, device, cfg, max_batches, use_amp) -> dict:
+    out = {}
+    for name, loader in guards.items():
+        _, out[name] = run_epoch(model, loader, criterion, ce, device, cfg, train=False,
+                                 max_batches=max_batches, use_amp=use_amp)
+    return out
+
+
 def _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, model,
-                criterion, ce, optimizer, scaler, use_amp, train_loader, sampler,
-                hosp_dev_loader, gen_dev_loader, device, max_batches, lock):
+                criterion, ce, optimizer, scaler, use_amp, make_loader,
+                hosp_dev_loader, guards, device, max_batches, lock):
     start_epoch, best, bad = 0, math.inf, 0
     best_epoch = None
     if os.path.exists(files["last"]) and not args.fresh:
@@ -593,7 +693,7 @@ def _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, mod
         restore_rng(ck["rng"])
         start_epoch, best, bad = ck["epoch"] + 1, ck["best_hosp_ce"], ck["bad_epochs"]
         best_epoch = ck.get("best_epoch")
-        base_hosp_ce, base_gen_ce = ck["base_hosp_ce"], ck["base_gen_ce"]
+        base_hosp_ce, base_guard = ck["base_hosp_ce"], ck["base_guard_ce"]
         print(f"[ft] picking up at epoch {start_epoch} (last session: {ck.get('owner', '?')}, "
               f"now: {args.owner}). best hospitality dev CE {best:.4f}, {bad}/{args.patience} bad")
     else:
@@ -602,13 +702,12 @@ def _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, mod
               f"(pretraining epoch {base_ck.get('epoch')})")
         _, base_hosp_ce = run_epoch(model, hosp_dev_loader, criterion, ce, device, cfg,
                                     train=False, max_batches=max_batches, use_amp=use_amp)
-        _, base_gen_ce = run_epoch(model, gen_dev_loader, criterion, ce, device, cfg,
-                                   train=False, max_batches=max_batches, use_amp=use_amp)
+        base_guard = _guard_ces(model, guards, criterion, ce, device, cfg, max_batches, use_amp)
     print(f"[ft] base model: hospitality dev CE {base_hosp_ce:.4f} "
-          f"(ppl {math.exp(min(base_hosp_ce, 20)):.2f}), general dev CE {base_gen_ce:.4f} "
-          f"(ppl {math.exp(min(base_gen_ce, 20)):.2f})")
-    print(f"[ft] an epoch only counts as best if general dev CE <= "
-          f"{base_gen_ce * (1 + args.gen_limit):.4f} (base + {args.gen_limit:.0%})")
+          f"(ppl {math.exp(min(base_hosp_ce, 20)):.2f})")
+    print("[ft] general CE, base: " + ", ".join(f"{k} {v:.4f}" for k, v in base_guard.items()))
+    print(f"[ft] an epoch only counts as best if each of those stays within "
+          f"{args.gen_limit:.0%} of the base")
 
     train_crit = criterion
     if args.method == "ewc":
@@ -617,7 +716,7 @@ def _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, mod
     logger = MetricsLogger(files["metrics"])
     stopped_by = None
     for epoch in range(start_epoch, cfg.epochs):
-        sampler.set_epoch(epoch)
+        train_loader = make_loader(epoch)
         touch_lock(lock, args.owner)
         reset_peak_vram()
         with Timer() as t:
@@ -627,10 +726,10 @@ def _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, mod
         ewc_term = train_crit.epoch_penalty() if isinstance(train_crit, EWCLoss) else 0.0
         _, hosp_ce = run_epoch(model, hosp_dev_loader, criterion, ce, device, cfg,
                                train=False, max_batches=max_batches, use_amp=use_amp)
-        _, gen_ce = run_epoch(model, gen_dev_loader, criterion, ce, device, cfg,
-                              train=False, max_batches=max_batches, use_amp=use_amp)
-        gen_change = gen_ce / base_gen_ce - 1.0
-        gen_ok = gen_change <= args.gen_limit
+        gce = _guard_ces(model, guards, criterion, ce, device, cfg, max_batches, use_amp)
+        change = {k: gce[k] / base_guard[k] - 1.0 for k in GUARD_SETS}
+        worst = max(change, key=change.get)
+        gen_ok = change[worst] <= args.gen_limit
         # over the general limit can't be a new best, and it counts toward patience,
         # so a run that keeps forgetting stops by itself
         improved = gen_ok and hosp_ce < best - 1e-4
@@ -639,30 +738,34 @@ def _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, mod
         else:
             bad += 1
 
-        logger.log({"tag": tag, "seed": args.seed, "epoch": epoch,
-                    "train_loss": round(tr_loss, 4), "ewc_term": round(ewc_term, 4),
-                    "hosp_dev_ce_base": round(base_hosp_ce, 4), "hosp_dev_ce": round(hosp_ce, 4),
-                    "hosp_dev_ppl": round(math.exp(min(hosp_ce, 20)), 3),
-                    "gen_dev_ce_base": round(base_gen_ce, 4), "gen_dev_ce": round(gen_ce, 4),
-                    "gen_change_pct": round(100 * gen_change, 2), "gen_ok": gen_ok,
-                    "saved": improved, "bad_epochs": bad, "lr": args.lr,
+        row = {"tag": tag, "seed": args.seed, "epoch": epoch,
+               "train_loss": round(tr_loss, 4), "ewc_term": round(ewc_term, 4),
+               "hosp_dev_ce_base": round(base_hosp_ce, 4), "hosp_dev_ce": round(hosp_ce, 4),
+               "hosp_dev_ppl": round(math.exp(min(hosp_ce, 20)), 3)}
+        for k in GUARD_SETS:
+            row[f"{k}_ce_base"] = round(base_guard[k], 4)
+            row[f"{k}_ce"] = round(gce[k], 4)
+            row[f"{k}_pct"] = round(100 * change[k], 2)
+        row.update({"gen_change_pct": round(100 * change[worst], 2), "gen_worst": worst,
+                    "gen_ok": gen_ok, "saved": improved, "bad_epochs": bad, "lr": args.lr,
                     "epoch_time_s": round(t.elapsed, 1), "peak_vram_gb": peak_vram_gb(),
                     "owner": args.owner})
+        logger.log(row)
         note = "saved" if improved else f"{bad}/{args.patience}"
         if not gen_ok:
-            note += f", general over the {args.gen_limit:.0%} limit"
+            note += f", {worst} over the {args.gen_limit:.0%} limit"
         ewc_txt = f" ewc {ewc_term:.4f}" if args.method == "ewc" else ""
         print(f"[ft] epoch {epoch}: train {tr_loss:.4f}{ewc_txt} | hospitality dev CE "
-              f"{hosp_ce:.4f} | general dev CE {gen_ce:.4f} ({100 * gen_change:+.2f}%) | "
+              f"{hosp_ce:.4f} | general worst {worst} {100 * change[worst]:+.2f}% | "
               f"{t.elapsed:.0f}s | {note}", flush=True)
 
         meta = {"arch": ARCH, "cfg": cfg.to_dict(), "vocab_size": vocab_size,
                 "seed": args.seed, "run_tag": tag, "settings": settings,
                 "base_ckpt": os.path.basename(d["base_ckpt"]),
-                "base_hosp_ce": base_hosp_ce, "base_gen_ce": base_gen_ce}
+                "base_hosp_ce": base_hosp_ce, "base_guard_ce": base_guard}
         if improved:
             safe_save({**meta, "model_state": model.state_dict(), "epoch": epoch,
-                       "hosp_dev_ce": hosp_ce, "gen_dev_ce": gen_ce}, files["best"], d)
+                       "hosp_dev_ce": hosp_ce, "guard_ce": gce}, files["best"], d)
         finished = bad >= args.patience or epoch == cfg.epochs - 1
         if finished:
             stopped_by = "patience" if bad >= args.patience else "epoch cap"
@@ -680,19 +783,18 @@ def _train_loop(args, d, files, settings, tag, base_ck, cfg, sp, vocab_size, mod
         return
     info = {"tag": tag, "seed": args.seed, "settings": settings, "stopped_by": stopped_by,
             "best_epoch": best_epoch, "best_hosp_dev_ce": None if math.isinf(best) else best,
-            "base_hosp_ce": base_hosp_ce, "base_gen_ce": base_gen_ce,
+            "base_hosp_ce": base_hosp_ce, "base_guard_ce": base_guard,
             "saved_any": best_epoch is not None,
             "finished_at": datetime.now().isoformat(timespec="seconds"), "owner": args.owner}
     with open(files["done"], "w", encoding="utf-8") as f:
         json.dump(info, f, indent=2)
     if best_epoch is None:
-        print(f"[ft] stopped ({stopped_by}) and nothing was saved: every epoch was more than "
-              f"{args.gen_limit:.0%} worse than the base on general dev. out of selection, "
+        print(f"[ft] stopped ({stopped_by}) and nothing was saved: every epoch had some general "
+              f"set more than {args.gen_limit:.0%} worse than the base. out of selection, "
               f"but worth listing in the write-up as a run that failed the guard")
     else:
         print(f"[ft] done ({stopped_by}). best epoch {best_epoch}, hospitality dev CE "
               f"{best:.4f} vs base {base_hosp_ce:.4f}. checkpoint: {files['best']}")
-
 
 def _setup_ewc(args, d, base_ck, cfg, sp, criterion, model, device):
     # anchor and fisher both come from the base weights, also on resume. anchoring to the
@@ -730,13 +832,18 @@ def _setup_ewc(args, d, base_ck, cfg, sp, criterion, model, device):
 
 # ------------------------------------------------------------ score-dev ----
 
-DEV_COLS = ["row_tag", "seed", "role", "method", "mix", "ewc_lambda", "alpha", "no_convlab",
-            "lr", "patience", "gen_limit", "best_epoch",
+DEV_COLS = ["row_tag", "seed", "role", "method", "mix", "mix_pool", "ewc_lambda", "alpha",
+            "no_convlab", "lr", "patience", "gen_limit", "best_epoch",
             "hosp_enzh_bleu", "hosp_enzh_chrf", "hosp_zhen_bleu", "hosp_zhen_chrf",
             "hosp_bleu_mean", "hosp_chrf_mean",
             "gen_enzh_bleu", "gen_enzh_chrf", "gen_zhen_bleu", "gen_zhen_chrf",
-            "gen_bleu_mean", "gen_bleu_drop", "n_hosp_enzh", "n_hosp_zhen", "n_gen",
+            "ood_enzh_bleu", "ood_enzh_chrf", "ood_zhen_bleu", "ood_zhen_chrf",
+            "gen_bleu_mean", "gen_bleu_drop",
+            "gen_enzh_drop", "gen_zhen_drop", "ood_enzh_drop", "ood_zhen_drop",
+            "worst_gen_drop", "worst_gen_set",
+            "n_hosp_enzh", "n_hosp_zhen", "n_gen", "n_ood",
             "beam", "ckpt", "ckpt_fp", "scored_at"]
+DROP_SETS = ("gen_enzh", "gen_zhen", "ood_enzh", "ood_zhen")
 
 
 def finished_runs(d) -> list:
@@ -752,10 +859,13 @@ def dev_sets(d, limit=None):
     meta = read_meta(os.path.join(d["data"], "dev_meta.tsv"), len(hosp))
     nat = natural_source_split(hosp, meta)
     gen = read_pairs(d["general_dev"])
+    ood = ood_dev_pairs(d)
     sets = {"hosp_enzh": (nat["en-zh"][0], nat["en-zh"][1], "zh"),
             "hosp_zhen": (nat["zh-en"][0], nat["zh-en"][1], "en"),
             "gen_enzh": ([en for _, en in gen], [zh for zh, _ in gen], "zh"),
-            "gen_zhen": ([zh for zh, _ in gen], [en for _, en in gen], "en")}
+            "gen_zhen": ([zh for zh, _ in gen], [en for _, en in gen], "en"),
+            "ood_enzh": ([en for _, en in ood], [zh for zh, _ in ood], "zh"),
+            "ood_zhen": ([zh for zh, _ in ood], [en for _, en in ood], "en")}
     if limit:
         sets = {k: (s[:limit], r[:limit], lang) for k, (s, r, lang) in sets.items()}
     return sets
@@ -770,7 +880,7 @@ def score_on_dev(model, cfg, sp, sets, device, beam):
         hyps_all[name] = hyps
         sigs[name] = {"bleu": s["bleu_sig"], "chrf": s["chrf_sig"]}
     out["n_hosp_enzh"], out["n_hosp_zhen"] = len(sets["hosp_enzh"][0]), len(sets["hosp_zhen"][0])
-    out["n_gen"] = len(sets["gen_enzh"][0])
+    out["n_gen"], out["n_ood"] = len(sets["gen_enzh"][0]), len(sets["ood_enzh"][0])
     out["hosp_bleu_mean"] = round((out["hosp_enzh_bleu"] + out["hosp_zhen_bleu"]) / 2, 2)
     out["hosp_chrf_mean"] = round((out["hosp_enzh_chrf"] + out["hosp_zhen_chrf"]) / 2, 2)
     out["gen_bleu_mean"] = round((out["gen_enzh_bleu"] + out["gen_zhen_bleu"]) / 2, 2)
@@ -809,10 +919,13 @@ def cmd_score_dev(args):
     sets = dev_sets(d, limit)
     print(f"[dev] hospitality dev: EN->ZH {len(sets['hosp_enzh'][0])} English-original lines, "
           f"ZH->EN {len(sets['hosp_zhen'][0])} Chinese-original lines. general dev: "
-          f"{len(sets['gen_enzh'][0])} lines each way. beam {beam}")
+          f"{len(sets['gen_enzh'][0])} lines each way. FLORES+ dev: "
+          f"{len(sets['ood_enzh'][0])} lines each way. beam {beam}")
     hyp_dir = os.path.join(d["results"], "dev_hyps")
     os.makedirs(hyp_dir, exist_ok=True)
-    rows = {(r["row_tag"], r["seed"]): r for r in read_dev_scores(d)}
+    # a row without FLORES+ dev scores is incomplete and gets scored
+    rows = {(r["row_tag"], r["seed"]): r for r in read_dev_scores(d)
+            if r.get("ood_enzh_bleu", "") != ""}
     sig_path = os.path.join(d["results"], "dev_scores_signatures.json")
 
     base_ck = load_state(d["base_ckpt"])
@@ -837,7 +950,8 @@ def cmd_score_dev(args):
 
     sigs = {}
     for row_tag, seed, role, run, alpha, ckpt in todo:
-        fp = file_fingerprint(ckpt) + ("" if alpha is None else f"-a{alpha}") + f"-b{beam}-l{limit}"
+        fp = (file_fingerprint(ckpt) + ("" if alpha is None else f"-a{alpha}")
+              + f"-b{beam}-l{limit}")
         old = rows.get((row_tag, seed))
         if old and old.get("ckpt_fp") == fp and not args.rescore:
             continue
@@ -856,7 +970,8 @@ def cmd_score_dev(args):
                "scored_at": datetime.now().isoformat(timespec="seconds"), **scores}
         if run:
             st = run["settings"]
-            row.update({"method": st["method"], "mix": st["mix"], "ewc_lambda": st["ewc_lambda"],
+            row.update({"method": st["method"], "mix": st["mix"],
+                        "mix_pool": st.get("mix_pool", 0), "ewc_lambda": st["ewc_lambda"],
                         "no_convlab": st["no_convlab"], "lr": st["lr"], "patience": st["patience"],
                         "gen_limit": st["gen_limit"], "best_epoch": run["best_epoch"],
                         "alpha": "" if alpha is None else alpha})
@@ -867,11 +982,19 @@ def cmd_score_dev(args):
             json.dump(hyps, f, ensure_ascii=False)
         print(f"[dev]   hospitality chrF++ {scores['hosp_chrf_mean']:.2f} "
               f"(EN->ZH {scores['hosp_enzh_chrf']:.2f}, ZH->EN {scores['hosp_zhen_chrf']:.2f}) | "
-              f"general BLEU {scores['gen_bleu_mean']:.2f}", flush=True)
+              f"general BLEU EN->ZH {scores['gen_enzh_bleu']:.2f} ZH->EN {scores['gen_zhen_bleu']:.2f} | "
+              f"FLORES+ dev BLEU EN->ZH {scores['ood_enzh_bleu']:.2f} ZH->EN "
+              f"{scores['ood_zhen_bleu']:.2f}", flush=True)
 
     base_row = rows.get(("base", str(BASE_SEED)))
     for r in rows.values():
         r["gen_bleu_drop"] = round(float(base_row["gen_bleu_mean"]) - float(r["gen_bleu_mean"]), 2)
+        drops = {k: round(float(base_row[f"{k}_bleu"]) - float(r[f"{k}_bleu"]), 2)
+                 for k in DROP_SETS}
+        for k, v in drops.items():
+            r[f"{k}_drop"] = v
+        r["worst_gen_set"] = max(drops, key=drops.get)
+        r["worst_gen_drop"] = drops[r["worst_gen_set"]]
     write_dev_scores(d, list(rows.values()))
     if sigs:
         with open(sig_path, "w", encoding="utf-8") as f:
@@ -881,28 +1004,43 @@ def cmd_score_dev(args):
 
 # --------------------------------------------------------------- select ----
 
+def on_grid(r, rule) -> bool:
+    """a seed-191 run or blend trained on the registered lr grid and settings"""
+    if r["role"] not in ("run", "interp") or str(r["seed"]) != str(SELECTION_SEED):
+        return False
+    budget, cand = rule["budget"], rule["candidates"]
+    ok = (any(math.isclose(float(r["lr"]), x) for x in budget["lrs"])
+          and int(r["patience"]) == int(budget["patience"])
+          and math.isclose(float(r["gen_limit"]), float(budget["gen_limit"])))
+    if r["method"] == "mixed":
+        ok = ok and int(float(r["mix"])) == int(cand["mix"]) \
+            and int(float(r["mix_pool"] or 0)) == int(cand["mix_pool"])
+    if r["method"] == "ewc":
+        ok = ok and any(math.isclose(float(r["ewc_lambda"]), x) for x in cand["ewc_lambdas"])
+    return ok
+
+
 def apply_rule(rows, rule):
     """returns (winner_row, eligible_rows, reasons). base never wins: it's the reference."""
     drop_max, tie = rule["max_gen_bleu_drop"], rule["tie_chrf"]
-    budget = rule["budget"]
     cands, notes = [], []
     for r in rows:
         if r["role"] not in ("run", "interp") or str(r["seed"]) != str(SELECTION_SEED):
             continue
-        if (float(r["lr"]), int(r["patience"]), float(r["gen_limit"])) != \
-                (float(budget["lr"]), int(budget["patience"]), float(budget["gen_limit"])):
-            notes.append(f"{r['row_tag']}: not on the registered budget, left out")
+        if not on_grid(r, rule):
+            notes.append(f"{r['row_tag']}: not on the registered grid, left out")
             continue
         cands.append(r)
-    eligible = [r for r in cands if float(r["gen_bleu_drop"]) <= drop_max]
+    eligible = [r for r in cands if float(r["worst_gen_drop"]) <= drop_max]
     for r in cands:
         if r not in eligible:
-            notes.append(f"{r['row_tag']}: general BLEU drop {float(r['gen_bleu_drop']):.2f} > {drop_max}")
+            notes.append(f"{r['row_tag']}: general BLEU drop {float(r['worst_gen_drop']):.2f} "
+                         f"on {r['worst_gen_set']} > {drop_max}")
     if not eligible:
         return None, eligible, notes
     top = max(float(r["hosp_chrf_mean"]) for r in eligible)
     close = [r for r in eligible if top - float(r["hosp_chrf_mean"]) <= tie]
-    close.sort(key=lambda r: (float(r["gen_bleu_drop"]), -float(r["hosp_chrf_mean"]), r["row_tag"]))
+    close.sort(key=lambda r: (float(r["worst_gen_drop"]), -float(r["hosp_chrf_mean"]), r["row_tag"]))
     return close[0], eligible, notes
 
 
@@ -911,20 +1049,24 @@ def _print_candidates(rows, base, winner, eligible, rule):
     cands = [r for r in rows if r["role"] in ("run", "interp")
              and str(r["seed"]) == str(SELECTION_SEED)]
     cands.sort(key=lambda r: -float(r["hosp_chrf_mean"]))
-    print(f"\n{'candidate':<38}{'hosp chrF++':>12}{'EN>ZH':>8}{'ZH>EN':>8}{'gen BLEU drop':>15}  note")
+    print(f"\n{'candidate':<38}{'hosp chrF++':>12}{'EN>ZH':>8}{'ZH>EN':>8}"
+          f"{'worst general drop':>20}  note")
     print(f"{'base':<38}{float(base['hosp_chrf_mean']):>12.2f}{float(base['hosp_enzh_chrf']):>8.2f}"
-          f"{float(base['hosp_zhen_chrf']):>8.2f}{0:>15.2f}")
+          f"{float(base['hosp_zhen_chrf']):>8.2f}{0:>20.2f}")
     for r in cands:
         if winner is not None and r is winner:
             note = "<- selected"
         elif r not in eligible:
-            note = "out (drop too big or off budget)"
+            over = float(r["worst_gen_drop"]) > float(rule["max_gen_bleu_drop"])
+            note = "out, drop over the limit" if over else "out, off the registered grid"
         else:
             note = ""
+        drop = f"{float(r['worst_gen_drop']):.2f} {r['worst_gen_set']}"
         print(f"{r['row_tag']:<38}{float(r['hosp_chrf_mean']):>12.2f}{float(r['hosp_enzh_chrf']):>8.2f}"
-              f"{float(r['hosp_zhen_chrf']):>8.2f}{float(r['gen_bleu_drop']):>15.2f}  {note}")
-    print(f"(rule: highest hospitality chrF++ with general BLEU drop <= {rule['max_gen_bleu_drop']}; "
-          f"within {rule['tie_chrf']} chrF++ counts as a tie, smaller drop wins)\n")
+              f"{float(r['hosp_zhen_chrf']):>8.2f}{drop:>20}  {note}")
+    print(f"(rule: highest hospitality chrF++ with no general BLEU drop over "
+          f"{rule['max_gen_bleu_drop']} in any direction on general dev or FLORES+ dev; within "
+          f"{rule['tie_chrf']} chrF++ counts as a tie, smaller worst drop wins)\n")
 
 
 def cmd_select(args):
@@ -942,8 +1084,9 @@ def cmd_select(args):
     plot_selection(rows, base, winner, rule, plot_path)
     sel_path = os.path.join(d["results"], "selection.json")
     if winner is None:
-        raise SystemExit(f"[select] nothing selected, no candidate stays within "
-                         f"{rule['max_gen_bleu_drop']} BLEU of the base on general dev. plot: {plot_path}")
+        raise SystemExit(f"[select] nothing selected, every candidate drops more than "
+                         f"{rule['max_gen_bleu_drop']} BLEU somewhere on general dev or FLORES+ "
+                         f"dev. plot: {plot_path}")
     if float(winner["hosp_chrf_mean"]) <= float(base["hosp_chrf_mean"]):
         print("[select] the winner doesn't beat the base on hospitality dev chrF++")
     with open(os.path.join(d["results"], "dev_scores.csv"), "rb") as f:
@@ -953,13 +1096,17 @@ def cmd_select(args):
            "parent_tag": run_tag(winner["method"], float(winner["lr"]), int(winner["patience"]),
                                  int(float(winner["mix"] or 0)), float(winner["ewc_lambda"] or 0)),
            "method": winner["method"], "mix": int(float(winner["mix"] or 0)),
+           "mix_pool": int(float(winner["mix_pool"] or 0)),
            "ewc_lambda": float(winner["ewc_lambda"] or 0),
            "alpha": float(alpha) if alpha not in ("", None) else None,
            "lr": float(winner["lr"]), "patience": int(winner["patience"]),
            "gen_limit": float(winner["gen_limit"]),
            "dev": {k: winner[k] for k in ("hosp_chrf_mean", "hosp_bleu_mean", "gen_bleu_mean",
-                                          "gen_bleu_drop")},
-           "base_dev": {k: base[k] for k in ("hosp_chrf_mean", "hosp_bleu_mean", "gen_bleu_mean")},
+                                          "gen_bleu_drop", "gen_enzh_drop", "gen_zhen_drop",
+                                          "ood_enzh_drop", "ood_zhen_drop", "worst_gen_drop",
+                                          "worst_gen_set")},
+           "base_dev": {k: base[k] for k in ("hosp_chrf_mean", "hosp_bleu_mean", "gen_bleu_mean",
+                                             "ood_enzh_bleu", "ood_zhen_bleu")},
            "n_candidates": len([r for r in rows if r["role"] in ("run", "interp")]),
            "n_eligible": len(eligible), "rule": {k: rule[k] for k in
                                                  ("max_gen_bleu_drop", "tie_chrf", "registered_at")},
@@ -979,7 +1126,8 @@ def cmd_select(args):
     with open(sel_path, "w", encoding="utf-8") as f:
         json.dump(sel, f, indent=2)
     print(f"[select] winner: {sel['winner']}  hospitality dev chrF++ {winner['hosp_chrf_mean']} "
-          f"(base {base['hosp_chrf_mean']}), general dev BLEU drop {winner['gen_bleu_drop']}")
+          f"(base {base['hosp_chrf_mean']}), worst general BLEU drop {winner['worst_gen_drop']} "
+          f"({winner['worst_gen_set']})")
     print(f"[select] wrote {sel_path} and {plot_path}")
 
 
@@ -998,42 +1146,50 @@ def plot_selection(rows, base, winner, rule, path):
     ink, muted = "#0b0b0b", "#52514e"
     bx, by = 0.0, float(base["hosp_chrf_mean"])
     drop_max = rule["max_gen_bleu_drop"]
-    cand = [r for r in rows if r["role"] in ("run", "interp")]
-    xs = [float(r["gen_bleu_drop"]) for r in cand] + [0.0]
+    cand = [r for r in rows if on_grid(r, rule)]   # off-grid runs can't win, so not drawn
+    xs = [float(r["worst_gen_drop"]) for r in cand] + [0.0]
     xmax = max(max(xs) + 0.4, drop_max + 0.6)
     ax.axvspan(drop_max, xmax, color="#ebeae6", zorder=0)
     ax.axvline(drop_max, color=muted, lw=1, ls="--", zorder=1)
     # each run: a thin path from the base through its interpolations to the run itself
     runs = [r for r in cand if r["role"] == "run"]
+    # with a full lr grid there can be 20 runs, so only the best few get a text label
+    labelled = {r["row_tag"] for r in sorted(runs, key=lambda r: -float(r["hosp_chrf_mean"]))[:6]}
+    p_tag = f"_p{rule['budget']['patience']}"
     seen = set()
     for r in runs:
         color, marker, label = METHOD_STYLE[r["method"]]
+        if r["method"] == "mixed":
+            label = f"mixed 1:{rule['candidates']['mix']}"
         path_rows = sorted([x for x in cand if x["role"] == "interp" and
                             x["row_tag"].startswith(r["row_tag"] + "_interp")],
                            key=lambda x: float(x["alpha"]))
-        px = [bx] + [float(x["gen_bleu_drop"]) for x in path_rows] + [float(r["gen_bleu_drop"])]
+        px = [bx] + [float(x["worst_gen_drop"]) for x in path_rows] + [float(r["worst_gen_drop"])]
         py = [by] + [float(x["hosp_chrf_mean"]) for x in path_rows] + [float(r["hosp_chrf_mean"])]
         ax.plot(px, py, color=color, lw=1, alpha=0.5, zorder=2)
-        ax.scatter([float(x["gen_bleu_drop"]) for x in path_rows],
+        ax.scatter([float(x["worst_gen_drop"]) for x in path_rows],
                    [float(x["hosp_chrf_mean"]) for x in path_rows], s=40, marker=marker,
                    facecolors="#fcfcfb", edgecolors=color, linewidths=1.5, zorder=3)
-        ax.scatter([float(r["gen_bleu_drop"])], [float(r["hosp_chrf_mean"])], s=64, marker=marker,
+        ax.scatter([float(r["worst_gen_drop"])], [float(r["hosp_chrf_mean"])], s=64, marker=marker,
                    color=color, edgecolors="#fcfcfb", linewidths=2, zorder=4,
                    label=label if r["method"] not in seen else None)
         seen.add(r["method"])
-        short = r["row_tag"].split("_", 2)[-1]
-        ax.annotate(short, (float(r["gen_bleu_drop"]), float(r["hosp_chrf_mean"])),
-                    xytext=(6, 4), textcoords="offset points", fontsize=7.5, color=muted)
+        if r["row_tag"] in labelled:
+            ax.annotate(r["row_tag"].replace(p_tag, ""),
+                        (float(r["worst_gen_drop"]), float(r["hosp_chrf_mean"])),
+                        xytext=(6, 4), textcoords="offset points", fontsize=7.5, color=muted)
     ax.scatter([bx], [by], s=80, marker="D", color=ink, zorder=5, label="base model")
     if winner is not None:
-        wx, wy = float(winner["gen_bleu_drop"]), float(winner["hosp_chrf_mean"])
+        wx, wy = float(winner["worst_gen_drop"]), float(winner["hosp_chrf_mean"])
         ax.scatter([wx], [wy], s=260, facecolors="none", edgecolors=ink, linewidths=1.5, zorder=6)
-        ax.annotate(f"selected: {winner['row_tag'].split('_', 2)[-1]}", (wx, wy), xytext=(10, -16),
+        ax.annotate(f"selected: {winner['row_tag'].replace(p_tag, '')}", (wx, wy), xytext=(10, -16),
                     textcoords="offset points", fontsize=8.5, color=ink)
     ax.scatter([], [], s=40, marker="o", facecolors="#fcfcfb", edgecolors=muted,
-               label="interpolated with base (alpha 0.25 / 0.5 / 0.75)")
+               label="interpolated with base (alpha "
+                     + " / ".join(f"{a:g}" for a in rule["candidates"]["alphas"]) + ")")
     ax.set_xlim(min(-0.3, min(xs) - 0.3), xmax)
-    ax.set_xlabel("general dev BLEU drop vs base (lower is better)", color=ink)
+    ax.set_xlabel("worst general BLEU drop vs base, any direction, general dev or FLORES+ dev "
+                  "(lower is better)", color=ink)
     ax.set_ylabel("hospitality dev chrF++ (mean of both directions)", color=ink)
     ax.set_title(f"Selection on dev: max general drop {drop_max} BLEU (shaded = ruled out), "
                  f"ties within {rule['tie_chrf']} chrF++", fontsize=9.5, color=ink, loc="left")
@@ -1294,6 +1450,11 @@ def cmd_preflight(args):
             problems.append(f"{a}/{b} overlap")
     print(f"  general dev content sha16 {content_sha16(d['general_dev'])} "
           f"(data_manifest.json dev_sha256_16 should match)")
+    ood = ood_dev_pairs(d)
+    ood_p = os.path.join(d["data"], "flores_dev.tsv.gz")
+    print(f"  FLORES+ dev: {len(ood)} pairs, content sha16 {content_sha16(ood_p)}")
+    if len(ood) < 900:
+        problems.append(f"FLORES+ dev has only {len(ood)} pairs, expected about 997")
     ck = load_state(d["base_ckpt"])
     print(f"  base: {ck['arch']}, pretraining epoch {ck.get('epoch')}, vocab {ck['vocab_size']}")
     if problems:
@@ -1315,10 +1476,11 @@ def main(argv=None):
     p = sub.add_parser("register-rule"); common(p)
     p.add_argument("--max-gen-bleu-drop", type=float, required=True)
     p.add_argument("--tie", type=float, required=True)
-    p.add_argument("--lr", type=float, required=True)
+    p.add_argument("--lrs", type=float, nargs="+", required=True)
     p.add_argument("--patience", type=int, required=True)
     p.add_argument("--gen-limit", type=float, required=True)
     p.add_argument("--mix", type=int, required=True)
+    p.add_argument("--mix-pool", type=int, required=True)
     p.add_argument("--ewc-lambdas", type=float, nargs="+", required=True)
     p.add_argument("--alphas", type=float, nargs="+", required=True)
     p.add_argument("--beam", type=int, required=True)
@@ -1328,8 +1490,10 @@ def main(argv=None):
     p.add_argument("--lr", type=float, required=True)
     p.add_argument("--patience", type=int, required=True)
     p.add_argument("--gen-limit", type=float, required=True,
-                   help="relative: 0.05 means general dev CE may be at most 5%% above the base")
+                   help="relative: 0.05 means each general set and direction may be at most 5%% above the base CE")
     p.add_argument("--mix", type=int, default=4, help="general pairs per hospitality pair (mixed)")
+    p.add_argument("--mix-pool", type=int, default=10,
+                   help="general pool size in epochs' worth, each epoch takes the next slice (mixed)")
     p.add_argument("--ewc-lambda", type=float, default=0.0)
     p.add_argument("--fisher-batches", type=int, default=200)
     p.add_argument("--seed", type=int, default=SELECTION_SEED)
